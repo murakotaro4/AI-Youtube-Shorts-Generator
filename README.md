@@ -297,6 +297,43 @@ The [AI Clipping API](https://muapi.ai/playground/ai-clipping?utm_source=github&
 
 Contributions are welcome! Please fork the repository and submit a pull request.
 
+### Offline timestamp regression tests
+
+Python 3.10+ and the standard library are sufficient for these tests. From the
+repository root, run the same command in PowerShell or a Unix shell:
+
+```bash
+python -S -m unittest discover -s tests -v
+```
+
+`-S` disables loading site packages. No dependency installation, API keys,
+videos, models, Whisper, or ffmpeg are needed. Synthetic transcript fixtures
+and fake LLM responses cover both classification and highlight scoring; tests
+reject attempted use of the default MuAPI backend or network connections.
+The package loads pipeline/API dependencies only when those entry points are
+requested, so pure transcript helpers can be imported independently.
+
+The timestamp contract is:
+
+- Segment and highlight timestamps are absolute seconds from the beginning of
+  the original video. Prompt timestamps retain their floating-point precision.
+- Videos of at least 1800 seconds use nominal 1200-second windows, starting
+  1140 seconds apart. Complete segments intersecting each window are included,
+  so a boundary-crossing sentence can extend the actual range beyond that window.
+- Each chunk keeps the original video's `duration`. `_window_start` and
+  `_window_end` describe the selected segments' actual range, bounded by the
+  video. Highlight timestamps are never offset a second time.
+- Candidate times must be finite and satisfy `window_start <= start < end <=
+  window_end` and the video bounds. Invalid intervals are discarded, not clamped
+  to a different clip. Full JSON-schema validation is separate follow-up work.
+- Candidates from all chunks are deduplicated and ranked together.
+  `get_highlights` still returns all ranked candidates; the pipeline selects the
+  requested top N clips.
+
+These tests do not establish SIWC connectivity, provider authorization, video
+rendering quality, or Windows media-runtime behavior. Follow-up work is tracked
+in [issue #1](https://github.com/murakotaro4/AI-Youtube-Shorts-Generator/issues/1).
+
 ## License
 
 This project is licensed under the MIT License.

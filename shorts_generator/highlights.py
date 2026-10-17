@@ -11,10 +11,9 @@ drive either MuAPI (default, --mode api) or a direct local LLM client
 (--mode local).
 """
 import json
+import math
 import re
 from typing import Callable, Dict, List, Optional
-
-from . import muapi
 
 
 LLMFn = Callable[[str], str]
@@ -61,15 +60,17 @@ Respond ONLY with valid JSON (no markdown, no explanation):
 {{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
 
 
-CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
-LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
-CHUNK_OVERLAP_SECONDS = 60
+CHUNK_SIZE_SECONDS = 1200       # nominal 20-min windows; keep boundary segments whole
+LONG_VIDEO_THRESHOLD = 1800     # chunk videos at least 30 min long
+CHUNK_OVERLAP_SECONDS = 60      # overlap between nominal windows
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
 MAX_HIGHLIGHT_API_ATTEMPTS = 3
 
 
 def call_muapi_llm(prompt: str) -> str:
     """Default LLM backend: MuAPI gpt-5-mini."""
+    from . import muapi
+
     result = muapi.run(
         "gpt-5-mini",
         {"prompt": prompt},
@@ -124,12 +125,35 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return default
 
 
-def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
-    """Normalize model output into the expected shape; skip invalid entries."""
+def _time_bounds(
+    duration: float,
+    window_start: float = 0.0,
+    window_end: Optional[float] = None,
+) -> tuple[float, float]:
+    """Return finite absolute bounds within the original video's duration."""
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("Video duration must be finite, nonnegative seconds.")
+    end = duration if window_end is None else window_end
+    if not math.isfinite(window_start) or not math.isfinite(end):
+        raise ValueError("Transcript window bounds must be finite seconds.")
+    end = min(end, duration)
+    if not 0 <= window_start <= end:
+        raise ValueError("Transcript window must lie within the video duration.")
+    return window_start, end
+
+
+def _sanitize_highlights(
+    raw_highlights: object,
+    duration: float,
+    *,
+    window_start: float = 0.0,
+    window_end: Optional[float] = None,
+) -> List[Dict]:
+    """Normalize fields; reject invalid absolute times without shifting/clamping."""
+    min_start, max_end = _time_bounds(duration, window_start, window_end)
     if not isinstance(raw_highlights, list):
         return []
 
-    max_end = duration if duration > 0 else float("inf")
     cleaned: List[Dict] = []
     for item in raw_highlights:
         if not isinstance(item, dict):
@@ -137,14 +161,10 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
 
         start = _coerce_float(item.get("start_time"), default=-1.0)
         end = _coerce_float(item.get("end_time"), default=-1.0)
-        if start < 0 or end <= start:
+        if not math.isfinite(start) or not math.isfinite(end):
             continue
-
-        if max_end != float("inf"):
-            start = min(start, max_end)
-            end = min(end, max_end)
-            if end <= start:
-                continue
+        if not min_start <= start < end <= max_end:
+            continue
 
         cleaned.append(
             {
@@ -173,25 +193,34 @@ def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dic
 
 def build_transcript_text(transcript: Dict) -> str:
     segments = transcript.get("segments", [])
-    return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    # Do not round a timestamp outside the exact bounds supplied to the model.
+    return "\n".join(f"[{float(s['start'])}s] {s['text'].strip()}" for s in segments)
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
+    """Select overlapping windows while preserving absolute segment timestamps.
+
+    A segment intersecting a nominal window is included whole, so a sentence
+    crossing its boundary is not lost. The actual bounds span the selected
+    segments; ``duration`` remains the full video length, never a chunk length.
+    """
     segments = transcript.get("segments", [])
     duration = transcript.get("duration", segments[-1]["end"] if segments else 0)
+    _time_bounds(duration)
     chunks = []
     start = 0
     while start < duration:
         end = min(start + CHUNK_SIZE_SECONDS, duration)
         chunk_segs = [
             s for s in segments
-            if s["start"] >= start and s["end"] <= end + CHUNK_OVERLAP_SECONDS
+            if s["start"] < end and s["end"] > start
         ]
         if chunk_segs:
             chunk = dict(transcript)
             chunk["segments"] = chunk_segs
-            chunk["duration"] = end - start
-            chunk["_offset"] = start
+            chunk["duration"] = duration
+            chunk["_window_start"] = max(0.0, min(s["start"] for s in chunk_segs))
+            chunk["_window_end"] = min(duration, max(s["end"] for s in chunk_segs))
             chunks.append(chunk)
         start += CHUNK_SIZE_SECONDS - CHUNK_OVERLAP_SECONDS
     return chunks
@@ -204,11 +233,15 @@ def call_highlight_api(
     num_clips: int,
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
+    *,
+    window_start: float = 0.0,
+    window_end: Optional[float] = None,
 ) -> Dict:
+    window_start, window_end = _time_bounds(duration, window_start, window_end)
     # Ask for ~2× the user's target so dedupe has headroom, but cap so the model
     # doesn't have to generate a huge JSON payload (which times out gpt-5-mini).
     target = max(num_clips * 2, 5)
-    natural_max = max(2 if is_chunk else 3, int(duration / 90))
+    natural_max = max(2 if is_chunk else 3, int((window_end - window_start) / 90))
     min_clips = min(target, natural_max, 8)
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
@@ -216,7 +249,12 @@ def call_highlight_api(
         density=content_info.get("density", "medium"),
         num_clips_instruction=f"Generate at least {min_clips} highlights",
     )
-    base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
+    time_contract = (
+        "All timestamps are absolute seconds from the start of the original video. "
+        "Do not rebase timestamps to the start of a chunk. "
+        f"Use {window_start} <= start_time < end_time <= {window_end}."
+    )
+    base_prompt = f"{system}\n\n{time_contract}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
     last_error = "unknown"
 
@@ -224,7 +262,12 @@ def call_highlight_api(
         raw = llm_fn(prompt)
         try:
             parsed = _parse_json_loose(raw)
-            highlights = _sanitize_highlights(parsed.get("highlights"), duration=duration)
+            highlights = _sanitize_highlights(
+                parsed.get("highlights"),
+                duration=duration,
+                window_start=window_start,
+                window_end=window_end,
+            )
             if highlights:
                 return {"highlights": highlights}
             last_error = "no valid highlights in response"
@@ -281,6 +324,7 @@ def get_highlights(
     """
     llm_fn = llm_fn or call_muapi_llm
     duration = transcript.get("duration", 0)
+    _time_bounds(duration)
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(f"[highlights] content={content_info.get('content_type')} density={content_info.get('density')} duration={duration:.0f}s", flush=True)
 
@@ -289,14 +333,25 @@ def get_highlights(
         print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
         all_highlights: List[Dict] = []
         for i, chunk in enumerate(chunks):
-            offset = chunk.get("_offset", 0)
             text = build_transcript_text(chunk)
-            print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
-            result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
-            for h in result.get("highlights", []):
-                h["start_time"] = float(h["start_time"]) + offset
-                h["end_time"] = float(h["end_time"]) + offset
-                all_highlights.append(h)
+            window_start = chunk["_window_start"]
+            window_end = chunk["_window_end"]
+            print(
+                f"[highlights] chunk {i + 1}/{len(chunks)} "
+                f"(absolute range {window_start:.1f}-{window_end:.1f}s)",
+                flush=True,
+            )
+            result = call_highlight_api(
+                text,
+                content_info,
+                duration,
+                num_clips=num_clips,
+                is_chunk=True,
+                llm_fn=llm_fn,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            all_highlights.extend(result.get("highlights", []))
         highlights = dedupe_highlights(all_highlights)
     else:
         text = build_transcript_text(transcript)
